@@ -4,6 +4,7 @@ import akka.actor.Props
 import akka.actor.Actor
 import akka.actor.ActorRef
 import scala.concurrent.duration._
+import scala.language.postfixOps
 
 object Replicator {
   case class Replicate(key: String, valueOption: Option[String], id: Long)
@@ -24,11 +25,16 @@ class Replicator(val replica: ActorRef) extends Actor {
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
 
+  override def preStart() =
+    context.system.scheduler.scheduleOnce(100 millis, self, "tick")
+
+  override def postRestart(reason: Throwable) = {}
+
+
+
   // map from sequence number to pair of sender and request
   var acks = Map.empty[Long, (ActorRef, Replicate)]
-  // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
-  var pending = Vector.empty[Snapshot]
-  
+
   var _seqCounter = 0L
   def nextSeq = {
     val ret = _seqCounter
@@ -39,7 +45,22 @@ class Replicator(val replica: ActorRef) extends Actor {
   
   /* TODO Behavior for the Replicator. */
   def receive: Receive = {
-    case _ =>
+    case r: Replicate => {
+      val sequenceNumber = nextSeq
+      acks += sequenceNumber ->(sender, r)
+      val snapshot =
+        replica ! Snapshot(r.key, r.valueOption, sequenceNumber)
+    }
+    case "tick" => {
+      context.system.scheduler.scheduleOnce(100 millis, self, "tick")
+      acks.foreach(p => replica ! Snapshot(p._2._2.key, p._2._2.valueOption, p._1))
+    }
+
+    case SnapshotAck(key, seq) => {
+      acks.get(seq).fold()(p => p._1 ! Replicated(p._2.key, p._2.id))
+      acks -= seq;
+    }
   }
+
 
 }

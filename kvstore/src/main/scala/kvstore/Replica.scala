@@ -12,6 +12,7 @@ import akka.actor.PoisonPill
 import akka.actor.OneForOneStrategy
 import akka.actor.SupervisorStrategy
 import akka.util.Timeout
+import scala.language.postfixOps
 
 object Replica {
 
@@ -73,10 +74,12 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   val leader: Receive = {
     case Insert(key, value, id) => {
       kv += key -> value
+      replicators.foreach(_ ! Replicate(key, Some(value), id))
       sender ! OperationAck(id)
     }
     case Remove(key, id) => {
       kv -= key
+      replicators.foreach(_ ! Replicate(key, None, id))
       sender ! OperationAck(id)
     }
     case Get(key, id) => {
@@ -102,6 +105,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       val replicator = secondaries get secondaryRef get; // get replicator
       replicators -= replicator;
       context.stop(replicator)
+      context.unwatch(secondaryRef)
     }
 
 
