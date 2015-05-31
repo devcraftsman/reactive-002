@@ -160,9 +160,11 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
                 waitingReplicateTick = 0;
                 context.become(leader)
               } // all replica finished, persistence finished => positive hack
+              case None => {}
             }
           }
         }
+        case None => {}
       }
     }
     case "replicateTick" => {
@@ -189,6 +191,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
             client ! OperationAck(id)
             context.become(leader)
           }
+          case None => {}
         }
       }
     }
@@ -244,6 +247,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       expectedSnapshot += 1
       replicatorWaiting.get(id) match {
         case Some(actor) => actor ! SnapshotAck(key, id)
+        case None => {}
       }
       replicatorWaiting -= id;
       persistAcks -= id
