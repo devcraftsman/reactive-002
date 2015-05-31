@@ -62,26 +62,40 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   var replicatorWaiting = Map.empty[Long, ActorRef]
 
+  var clientWaiting = Map.empty[Long, ActorRef]
+
   var persistAcks = Map.empty[Long, Persist]
 
-  implicit val t: Timeout = Timeout(1 seconds)
+  var isLeader: Boolean = false;
 
-  override val supervisorStrategy = OneForOneStrategy(10, 1.minutes) {
-    case _: PersistenceException => {
-      Resume
+  var waitingTick = 0
+
+  var waitingReplicateTick = 0
+
+  var replicatorsReplicatedWaiting = Map.empty[Long, Set[ActorRef]];
+
+  override val supervisorStrategy = {
+    OneForOneStrategy(10, 1 minutes) {
+      case _: PersistenceException => {
+        Resume
+      }
     }
   }
 
 
   override def preStart(): Unit = {
     context.system.scheduler.scheduleOnce(100 millis, self, "tick")
+    context.system.scheduler.scheduleOnce(100 millis, self, "replicateTick")
     persistence = context.actorOf(persistenceProps)
     arbiter ! Join
   }
 
 
   def receive = {
-    case JoinedPrimary => context.become(leader)
+    case JoinedPrimary => {
+      isLeader = true;
+      context.become(leader)
+    }
     case JoinedSecondary => context.become(replica)
   }
 
@@ -91,12 +105,21 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case Insert(key, value, id) => {
       kv += key -> value
       replicators.foreach(_ ! Replicate(key, Some(value), id))
-      sender ! OperationAck(id)
+      clientWaiting += id -> sender
+      val persist = Persist(key, Some(value), id)
+      persistAcks += id -> persist
+      persistence ! persist
+      replicatorsReplicatedWaiting += id -> replicators
+      context.become(waitingLeaderPersist)
     }
     case Remove(key, id) => {
       kv -= key
       replicators.foreach(_ ! Replicate(key, None, id))
-      sender ! OperationAck(id)
+      clientWaiting += id -> sender
+      val persist = Persist(key, None, id)
+      persistAcks += id -> persist
+      persistence ! persist
+      context.become(waitingLeaderPersist)
     }
     case Get(key, id) => {
       sender ! GetResult(key, kv get key, id)
@@ -114,8 +137,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         context.watch(replica)
       })
     }
-
-
     // removing replicator when replica leaves the system
     case Terminated(secondaryRef) => {
       val replicator = secondaries get secondaryRef get; // get replicator
@@ -125,6 +146,65 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     }
 
 
+  }
+
+  val waitingReplicated: Receive = {
+    case Replicated(key, id) => {
+      replicatorsReplicatedWaiting.get(id) match {
+        case Some(repls) => {
+          replicatorsReplicatedWaiting += id -> (repls - sender)
+          if (repls.size == 1) {
+            clientWaiting.get(id) match {
+              case Some(client) => {
+                client ! OperationAck(id)
+                waitingReplicateTick = 0;
+                context.become(leader)
+              } // all replica finished, persistence finished => positive hack
+            }
+          }
+        }
+      }
+    }
+    case "replicateTick" => {
+      waitingReplicateTick += 1
+      if (waitingReplicateTick >= 10) {
+        clientWaiting.foreach(p => p._2 ! OperationFailed(p._1))
+        context.become(leader)
+      } else {
+        context.system.scheduler.scheduleOnce(100 millis, self, "replicateTick")
+      }
+
+    }
+
+  }
+
+  val waitingLeaderPersist: Receive = {
+    case Persisted(key, id) => {
+      waitingTick = 0
+      if (replicators.size > 0) {
+        context.become(waitingReplicated)
+      } else {
+        clientWaiting.get(id) match {
+          case Some(client) => {
+            client ! OperationAck(id)
+            context.become(leader)
+          }
+        }
+      }
+    }
+    case Get(key, id) => {
+      sender ! GetResult(key, kv get key, id)
+    }
+    case "tick" => {
+      waitingTick += 1
+      if (waitingTick < 10) {
+        context.system.scheduler.scheduleOnce(100 millis, self, "tick")
+        persistAcks.foreach(p => persistence ! p._2)
+      } else {
+        clientWaiting.foreach(p => p._2 ! OperationFailed(p._1))
+      }
+
+    }
   }
 
 
@@ -149,7 +229,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
           replicatorWaiting += s.seq -> sender
           persistAcks += s.seq -> persist
           persistence ! persist
-          context.become(waitingpersist)
+          context.become(waitingReplicaPersist)
         } else {
           sender ! SnapshotAck(s.key, s.seq)
         }
@@ -159,7 +239,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     }
   }
 
-  val waitingpersist: Receive = {
+  val waitingReplicaPersist: Receive = {
     case Persisted(key, id) => {
       expectedSnapshot += 1
       replicatorWaiting.get(id) match {

@@ -59,6 +59,7 @@ class Replicator(val replica: ActorRef) extends Actor {
     case SnapshotAck(key, seq) => {
       acks.get(seq).fold()(p => p._1 ! Replicated(p._2.key, p._2.id))
       acks -= seq;
+
     }
   }
 
