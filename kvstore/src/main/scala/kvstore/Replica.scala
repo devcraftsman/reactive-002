@@ -3,7 +3,7 @@ package kvstore
 import akka.actor.{OneForOneStrategy, Props, ActorRef, Actor}
 import kvstore.Arbiter._
 import scala.collection.immutable.Queue
-import akka.actor.SupervisorStrategy.Restart
+import akka.actor.SupervisorStrategy.{Resume, Restart}
 import scala.annotation.tailrec
 import akka.pattern.{ask, pipe}
 import akka.actor.Terminated
@@ -58,8 +58,24 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   // the replica snapshotExpectedNumber
   var expectedSnapshot = 0
+  var persistence: ActorRef = ActorRef.noSender;
+
+  var replicatorWaiting = Map.empty[Long, ActorRef]
+
+  var persistAcks = Map.empty[Long, Persist]
+
+  implicit val t: Timeout = Timeout(1 seconds)
+
+  override val supervisorStrategy = OneForOneStrategy(10, 1.minutes) {
+    case _: PersistenceException => {
+      Resume
+    }
+  }
+
 
   override def preStart(): Unit = {
+    context.system.scheduler.scheduleOnce(100 millis, self, "tick")
+    persistence = context.actorOf(persistenceProps)
     arbiter ! Join
   }
 
@@ -125,16 +141,40 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case Get(key, id) => {
       sender ! GetResult(key, kv get key, id)
     }
-    case Snapshot(key, valueOption, seq) => {
-      if (seq <= expectedSnapshot) {
-        if (seq == expectedSnapshot) {
-          valueOption.fold(kv -= key)(kv += key -> _)
-          expectedSnapshot += 1
+    case s: Snapshot => {
+      if (s.seq <= expectedSnapshot) {
+        if (s.seq == expectedSnapshot) {
+          s.valueOption.fold(kv -= s.key)(kv += s.key -> _)
+          val persist = Persist(s.key, s.valueOption, s.seq)
+          replicatorWaiting += s.seq -> sender
+          persistAcks += s.seq -> persist
+          persistence ! persist
+          context.become(waitingpersist)
+        } else {
+          sender ! SnapshotAck(s.key, s.seq)
         }
-        sender ! SnapshotAck(key, seq)
       }
 
 
+    }
+  }
+
+  val waitingpersist: Receive = {
+    case Persisted(key, id) => {
+      expectedSnapshot += 1
+      replicatorWaiting.get(id) match {
+        case Some(actor) => actor ! SnapshotAck(key, id)
+      }
+      replicatorWaiting -= id;
+      persistAcks -= id
+      context.become(replica)
+    }
+    case Get(key, id) => {
+      sender ! GetResult(key, kv get key, id)
+    }
+    case "tick" => {
+      context.system.scheduler.scheduleOnce(100 millis, self, "tick")
+      persistAcks.foreach(p => persistence ! p._2)
     }
   }
 
